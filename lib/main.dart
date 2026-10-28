@@ -73,7 +73,14 @@ class _WeatherPageState extends State<WeatherPage> {
       final results = await Future.wait([http.get(weatherUrl), http.get(cityUrl)]);
       data = jsonDecode(results[0].body);
       final geo = jsonDecode(results[1].body);
-      city = (geo['city'] ?? geo['locality'] ?? 'Ваше местоположение').toString();
+
+      var name = (geo['locality'] ?? geo['city'] ?? 'Ваше местоположение').toString();
+      name = name
+          .replaceFirst(RegExp(r'^(Городской округ|Муниципальное образование)\s*'), '')
+          .replaceAll(RegExp(r'[«»"]'), '')
+          .replaceFirst(RegExp(r'^город\s+'), '')
+          .trim();
+      city = name.isEmpty ? 'Ваше местоположение' : name;
     } catch (e) {
       error = e.toString();
     }
