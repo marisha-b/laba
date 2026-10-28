@@ -26,13 +26,17 @@ class _WeatherPageState extends State<WeatherPage> {
   bool loading = true;
   String? error;
   String city = '';
+  bool isMyLocation = true;
+  double? _lat, _lon;
   Map<String, dynamic>? data;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _loadMyLocation();
   }
+
+  // ---------- Данные ----------
 
   Future<Position> _getPosition() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
@@ -51,47 +55,115 @@ class _WeatherPageState extends State<WeatherPage> {
     return Geolocator.getCurrentPosition();
   }
 
-  Future<void> _load() async {
+  String _clean(String s) {
+    var r = s
+        .replaceAll(RegExp(r'[«»"]'), '')
+        .replaceAll(RegExp(r'[Гг]ородской округ'), '')
+        .trim();
+    r = r.replaceAll(RegExp(r'^([Гг]ород|г\.)\s+'), '').trim();
+    return r;
+  }
+
+  Future<String> _reverseName(double lat, double lon) async {
+    try {
+      final res = await http.get(Uri.parse(
+          'https://api.bigdatacloud.net/data/reverse-geocode-client'
+          '?latitude=$lat&longitude=$lon&localityLanguage=ru'));
+      final geo = jsonDecode(res.body);
+      final candidates = [geo['city'], geo['locality'], geo['principalSubdivision']]
+          .where((e) => e != null)
+          .map((e) => _clean(e.toString()))
+          .where((e) => e.isNotEmpty)
+          .toList();
+      for (final c in candidates) {
+        final low = c.toLowerCase();
+        if (!low.contains('район') && !low.contains('округ') && !low.contains('область')) {
+          return c;
+        }
+      }
+      if (candidates.isNotEmpty) return candidates.first;
+    } catch (_) {}
+    return 'Моё местоположение';
+  }
+
+  Future<Map<String, dynamic>> _fetchWeather(double lat, double lon) async {
+    final url = Uri.parse(
+        'https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon'
+        '&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code'
+        '&hourly=temperature_2m,weather_code'
+        '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max'
+        '&timezone=auto&forecast_days=10');
+    final res = await http.get(url);
+    return jsonDecode(res.body);
+  }
+
+  Future<void> _loadMyLocation() async {
     setState(() {
       loading = true;
       error = null;
     });
     try {
       final pos = await _getPosition();
-      final lat = pos.latitude, lon = pos.longitude;
-
-      final weatherUrl = Uri.parse(
-          'https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon'
-          '&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code'
-          '&hourly=temperature_2m,weather_code'
-          '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max'
-          '&timezone=auto&forecast_days=10');
-      final cityUrl = Uri.parse(
-          'https://api.bigdatacloud.net/data/reverse-geocode-client'
-          '?latitude=$lat&longitude=$lon&localityLanguage=ru');
-
-      final results = await Future.wait([http.get(weatherUrl), http.get(cityUrl)]);
-      data = jsonDecode(results[0].body);
-      final geo = jsonDecode(results[1].body);
-
-      var name = (geo['locality'] ?? geo['city'] ?? 'Ваше местоположение').toString();
-      name = name
-          .replaceFirst(RegExp(r'^(Городской округ|Муниципальное образование)\s*'), '')
-          .replaceAll(RegExp(r'[«»"]'), '')
-          .replaceFirst(RegExp(r'^город\s+'), '')
-          .trim();
-      city = name.isEmpty ? 'Ваше местоположение' : name;
+      final results = await Future.wait([
+        _fetchWeather(pos.latitude, pos.longitude),
+        _reverseName(pos.latitude, pos.longitude),
+      ]);
+      data = results[0] as Map<String, dynamic>;
+      city = results[1] as String;
+      _lat = pos.latitude;
+      _lon = pos.longitude;
+      isMyLocation = true;
     } catch (e) {
       error = e.toString();
     }
     if (mounted) setState(() => loading = false);
   }
 
+  Future<void> _loadCity(double lat, double lon, String name) async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      data = await _fetchWeather(lat, lon);
+      city = name;
+      _lat = lat;
+      _lon = lon;
+      isMyLocation = false;
+    } catch (e) {
+      error = e.toString();
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> _refresh() {
+    if (isMyLocation || _lat == null) return _loadMyLocation();
+    return _loadCity(_lat!, _lon!, city);
+  }
+
+  Future<void> _openSearch() async {
+    final picked = await showModalBottomSheet<Map<String, dynamic>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => const _CitySearch(),
+    );
+    if (picked != null) {
+      _loadCity(
+        (picked['latitude'] as num).toDouble(),
+        (picked['longitude'] as num).toDouble(),
+        picked['name'].toString(),
+      );
+    }
+  }
+
+  // ---------- Оформление ----------
+
   IconData _icon(int code) {
     if (code == 0) return Icons.wb_sunny;
     if (code <= 3) return Icons.cloud;
     if (code == 45 || code == 48) return Icons.foggy;
     if (code >= 71 && code <= 77) return Icons.ac_unit;
+    if (code >= 85 && code <= 86) return Icons.ac_unit;
     if (code >= 95) return Icons.thunderstorm;
     return Icons.water_drop;
   }
@@ -124,20 +196,44 @@ class _WeatherPageState extends State<WeatherPage> {
           ),
         ),
         child: SafeArea(
-          child: loading
-              ? const Center(child: CircularProgressIndicator())
-              : error != null
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(mainAxisSize: MainAxisSize.min, children: [
-                          Text(error!, textAlign: TextAlign.center),
-                          const SizedBox(height: 16),
-                          FilledButton(onPressed: _load, child: const Text('Повторить')),
-                        ]),
-                      ),
-                    )
-                  : RefreshIndicator(onRefresh: _load, child: _content()),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    TextButton.icon(
+                      onPressed: _loadMyLocation,
+                      icon: Icon(isMyLocation ? Icons.my_location : Icons.location_searching),
+                      label: const Text('Моё местоположение'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _openSearch,
+                      icon: const Icon(Icons.search),
+                      label: const Text('Поиск города'),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : error != null
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                Text(error!, textAlign: TextAlign.center),
+                                const SizedBox(height: 16),
+                                FilledButton(onPressed: _refresh, child: const Text('Повторить')),
+                              ]),
+                            ),
+                          )
+                        : RefreshIndicator(onRefresh: _refresh, child: _content()),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -148,7 +244,6 @@ class _WeatherPageState extends State<WeatherPage> {
     final hourly = data!['hourly'];
     final daily = data!['daily'];
 
-    // Ближайшие 7 отметок почасового прогноза с шагом 3 часа
     final times = (hourly['time'] as List).cast<String>();
     var start = times.indexWhere((t) => t.compareTo(cur['time']) >= 0);
     if (start < 0) start = 0;
@@ -160,11 +255,11 @@ class _WeatherPageState extends State<WeatherPage> {
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.all(16),
       children: [
-        const SizedBox(height: 16),
+        const SizedBox(height: 8),
         Center(
           child: Text(city,
               textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w500)),
+              style: const TextStyle(fontSize: 36, fontWeight: FontWeight.w500)),
         ),
         Center(
           child: Text('${(cur['temperature_2m'] as num).round()}°',
@@ -259,6 +354,109 @@ class _WeatherPageState extends State<WeatherPage> {
           ),
         ]),
       ],
+    );
+  }
+}
+
+// ---------- Поиск города ----------
+
+class _CitySearch extends StatefulWidget {
+  const _CitySearch();
+  @override
+  State<_CitySearch> createState() => _CitySearchState();
+}
+
+class _CitySearchState extends State<_CitySearch> {
+  List<Map<String, dynamic>> results = [];
+  bool searching = false;
+  String? message;
+  int _counter = 0;
+
+  Future<void> _search(String q) async {
+    q = q.trim();
+    final my = ++_counter;
+    if (q.length < 2) {
+      setState(() {
+        results = [];
+        message = null;
+      });
+      return;
+    }
+    setState(() => searching = true);
+    try {
+      final res = await http.get(Uri.parse(
+          'https://geocoding-api.open-meteo.com/v1/search'
+          '?name=${Uri.encodeComponent(q)}&count=8&language=ru&format=json'));
+      if (my != _counter) return; // пришёл устаревший ответ
+      final json = jsonDecode(res.body);
+      final list = (json['results'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      setState(() {
+        results = list;
+        message = list.isEmpty ? 'Ничего не найдено' : null;
+      });
+    } catch (e) {
+      if (my != _counter) return;
+      setState(() {
+        results = [];
+        message = 'Не удалось выполнить поиск. Проверьте интернет';
+      });
+    }
+    if (mounted && my == _counter) setState(() => searching = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+        left: 16,
+        right: 16,
+        top: 16,
+      ),
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.6,
+        child: Column(
+          children: [
+            TextField(
+              autofocus: true,
+              onChanged: _search,
+              decoration: InputDecoration(
+                hintText: 'Введите название города',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: searching
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2)),
+                      )
+                    : null,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+            ),
+            if (message != null)
+              Padding(padding: const EdgeInsets.all(16), child: Text(message!)),
+            Expanded(
+              child: ListView.builder(
+                itemCount: results.length,
+                itemBuilder: (_, i) {
+                  final r = results[i];
+                  final sub = [r['admin1'], r['country']]
+                      .where((e) => e != null && e.toString().isNotEmpty)
+                      .join(', ');
+                  return ListTile(
+                    leading: const Icon(Icons.location_city),
+                    title: Text(r['name'].toString()),
+                    subtitle: Text(sub),
+                    onTap: () => Navigator.pop(context, r),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
